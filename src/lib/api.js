@@ -1,47 +1,41 @@
 // src/lib/api.js
-const API_BASE = import.meta.env.VITE_API_BASE;
-const OP_KEY = import.meta.env.VITE_OPERATOR_KEY;
+const API_BASE = ""; // IMPORTANT: same-origin (https://srv873265.hstgr.cloud)
 
-async function req(path, { method = "GET", body } = {}) {
-  if (!API_BASE) throw new Error("Missing VITE_API_BASE");
-  if (!OP_KEY) throw new Error("Missing VITE_OPERATOR_KEY");
-
-  const url = `${API_BASE}${path}`;
-
-  const res = await fetch(url, {
-    method,
+async function jfetch(path, opts = {}) {
+  const r = await fetch(API_BASE + path, {
+    ...opts,
+    credentials: "include", // IMPORTANT: trimite cookie
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${OP_KEY}`,
+      ...(opts.headers || {}),
     },
-    body: body ? JSON.stringify(body) : undefined,
   });
 
-  const text = await res.text();
-  let data;
-  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
-
-  if (!res.ok) {
-    const msg = data?.error || `${res.status} ${res.statusText}`;
-    throw new Error(msg);
+  // dacă primești 401, poți redirect la /login
+  if (r.status === 401) {
+    throw new Error("Unauthorized (401)");
   }
-  return data;
+
+  const ct = r.headers.get("content-type") || "";
+  if (ct.includes("application/json")) return await r.json();
+  return await r.text();
 }
 
 export const OperatorAPI = {
-  listConversations() {
-    return req("/api/operator/conversations");
-  },
-  getMessages(convId) {
-    return req(`/api/operator/conversations/${convId}/messages`);
-  },
-  sendMessage(convId, content) {
-    return req(`/api/operator/conversations/${convId}/messages`, { method: "POST", body: { content } });
-  },
-  takeover(convId) {
-    return req(`/api/operator/conversations/${convId}/takeover`, { method: "POST" });
-  },
-  close(convId) {
-    return req(`/api/operator/conversations/${convId}/close`, { method: "POST" });
-  },
+  me: () => jfetch("/api/op/me", { method: "GET" }),
+  login: (email, password) =>
+    jfetch("/api/op/login", { method: "POST", body: JSON.stringify({ email, password }) }),
+  logout: () => jfetch("/api/op/logout", { method: "POST" }),
+
+  // IMPORTANT: conversations vin din /api/operator, dar acum sunt protejate cu cookie JWT
+  listConversations: () => jfetch("/api/operator/conversations", { method: "GET" }),
+  getMessages: (conversationId) => jfetch(`/api/operator/conversations/${conversationId}/messages`, { method: "GET" }),
+  sendMessage: (conversationId, content) =>
+    jfetch(`/api/operator/conversations/${conversationId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content }),
+    }),
+
+  takeover: (conversationId) => jfetch(`/api/operator/conversations/${conversationId}/takeover`, { method: "POST" }),
+  close: (conversationId) => jfetch(`/api/operator/conversations/${conversationId}/close`, { method: "POST" }),
 };
