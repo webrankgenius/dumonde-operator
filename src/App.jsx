@@ -85,8 +85,7 @@ function Badge({ children }) {
 }
 
 function toneDot(status) {
-  const color =
-    status === "pending" ? "#F59E0B" : status === "closed" ? "#EF4444" : "#22C55E";
+  const color = status === "pending" ? "#F59E0B" : status === "closed" ? "#EF4444" : "#22C55E";
   return <span style={{ width: 8, height: 8, borderRadius: 999, background: color, display: "inline-block" }} />;
 }
 
@@ -101,6 +100,12 @@ export default function App() {
 
   const socketRef = useRef(null);
   const msgScrollRef = useRef(null);
+
+  // IMPORTANT: ref ca să nu folosim activeId "înghețat" în listener
+  const activeIdRef = useRef(null);
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
 
   const convList = useMemo(() => asArray(convs), [convs]);
   const active = useMemo(() => convList.find((c) => c.id === activeId) || null, [convList, activeId]);
@@ -124,9 +129,10 @@ export default function App() {
     const data = await OperatorAPI.getMessages(id);
     setMsgs(sortByCreatedAtAsc(msgListFromApi(data)));
 
-    // join imediat (ca să nu ratăm mesajele)
+    // join imediat (dacă socket e conectat, join direct; altfel îl prinde effect-ul de activeId)
     try {
-      socketRef.current?.emit("join:conversation", { conversationId: id });
+      const s = socketRef.current;
+      if (s?.connected) s.emit("join:conversation", { conversationId: id });
     } catch {}
 
     setTimeout(() => scrollToBottom(false), 0);
@@ -186,67 +192,105 @@ export default function App() {
 
   function downloadChat() {
     if (!active) return;
-    downloadFile(`dumonde-chat-${active.id}.json`, JSON.stringify({ conversation: active, messages: msgs }, null, 2), "application/json;charset=utf-8");
+    downloadFile(
+      `dumonde-chat-${active.id}.json`,
+      JSON.stringify({ conversation: active, messages: msgs }, null, 2),
+      "application/json;charset=utf-8"
+    );
     downloadFile(`dumonde-chat-${active.id}.txt`, buildChatTxt(active, msgs), "text/plain;charset=utf-8");
   }
 
-  // initial load + periodic refresh (ca safety net)
+  // initial load + periodic refresh (safety net)
   useEffect(() => {
     refreshConvs().catch((e) => setErr(e?.message || String(e)));
     const t = setInterval(() => refreshConvs({ silent: true }).catch(() => {}), 6000);
     return () => clearInterval(t);
   }, []);
 
-  // socket init ONCE
+  // socket init ONCE (cu guard anti-StrictMode double mount)
   useEffect(() => {
+    if (socketRef.current) return;
+
     const s = connectOperatorSocket();
     socketRef.current = s;
 
-    s.on("connect", () => console.log("[OP] ws connected", s.id));
-    s.on("connect_error", (e) => console.log("[OP] ws connect_error", e?.message || e));
+    s.on("connect", () => {
+      console.log("[OP] ws connected", s.id, "ns=", s.nsp);
+      // dacă avem deja conversație activă, fă join imediat după connect
+      const cid = activeIdRef.current;
+      if (cid) {
+        try {
+          s.emit("join:conversation", { conversationId: cid });
+        } catch {}
+      }
+    });
 
-    // broadcast global: update sidebar without manual refresh
+    s.on("connect_error", (e) => console.log("[OP] ws connect_error", e?.message || e));
+    s.on("disconnect", (r) => console.log("[OP] ws disconnected", r));
+
+    // IMPORTANT: doar un singur listener pentru message:new
     s.on("conversation:updated", () => {
       refreshConvs({ silent: true }).catch(() => {});
     });
 
-    // room event: only for active conversation (joined)
     s.on("message:new", (payload) => {
       const cid = payload?.conversationId;
       if (!cid) return;
 
-      // refresh sidebar always (preview / lastMessageAt)
+      // sidebar refresh/reorder
       refreshConvs({ silent: true }).catch(() => {});
 
-      if (cid === activeId) {
+      // adaugă live doar dacă e conversația activă (folosim ref)
+      const currentActive = activeIdRef.current;
+      if (cid === currentActive) {
         const m = payload?.message || payload;
-        setMsgs((prev) => sortByCreatedAtAsc([...prev, m]));
+        if (!m) return;
+
+        setMsgs((prev) => {
+          const next = [...prev, m];
+          // dedupe (în caz de resend/fallback)
+          const seen = new Set();
+          const uniq = [];
+          for (const x of next) {
+            const key = x?.id || `${x?.role}|${x?.createdAt}|${x?.content}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            uniq.push(x);
+          }
+          return sortByCreatedAtAsc(uniq);
+        });
+
         setTimeout(() => scrollToBottom(true), 0);
       }
     });
 
     return () => {
-      try { s.close(); } catch {}
+      try {
+        s.close();
+      } catch {}
+      socketRef.current = null;
     };
-    // IMPORTANT: empty deps = ONE TIME
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // join/leave room when active changes (also leave old)
+  // join/leave room when active changes (ROBUST: dacă nu e conectat încă, așteaptă connect)
   useEffect(() => {
     const s = socketRef.current;
-    if (!s) return;
+    if (!s || !activeId) return;
 
-    // leave all rooms by convention: you can track previous id
-    // simplest: on change, emit leave for previous via cleanup
-    if (activeId) {
-      try { s.emit("join:conversation", { conversationId: activeId }); } catch {}
-    }
+    const join = () => {
+      try {
+        s.emit("join:conversation", { conversationId: activeId });
+      } catch {}
+    };
+
+    if (s.connected) join();
+    else s.once("connect", join);
 
     return () => {
-      if (activeId) {
-        try { s.emit("leave:conversation", { conversationId: activeId }); } catch {}
-      }
+      try {
+        s.emit("leave:conversation", { conversationId: activeId });
+      } catch {}
     };
   }, [activeId]);
 
@@ -313,28 +357,47 @@ export default function App() {
             <div style={{ display: "grid", gap: 10 }}>
               {convList.map((c) => {
                 const isActive = c.id === activeId;
+                const urgent = Number(c.priority || 0) >= 3 || c.status === "pending";
                 const preview = c?.lastMessage?.content ? String(c.lastMessage.content) : "";
                 return (
                   <button
                     key={c.id}
-                    onClick={() => openConversation(c.id).catch((e) => setErr(e?.message || String(e)))}
+                    onClick={() => openConversation(c.id)}
                     style={{
                       textAlign: "left",
-                      padding: 12,
-                      borderRadius: 14,
-                      border: isActive ? "1px solid rgba(99,102,241,0.7)" : "1px solid rgba(255,255,255,0.10)",
-                      background: isActive ? "rgba(99,102,241,0.15)" : "rgba(255,255,255,0.04)",
-                      color: "white",
+                      padding: 10,
+                      borderRadius: 10,
+                      border: urgent
+                        ? "1px solid rgba(239,68,68,0.60)"
+                        : isActive
+                        ? "1px solid rgba(99,102,241,0.7)"
+                        : "1px solid rgba(255,255,255,0.10)",
+
+                      background: urgent
+                        ? "rgba(239,68,68,0.10)"
+                        : isActive
+                        ? "rgba(99,102,241,0.15)"
+                        : "rgba(255,255,255,0.04)",
+
                       cursor: "pointer",
-                      width: "100%",
                     }}
                   >
-                    <div style={{ fontWeight: 800, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <div
+                      style={{
+                        fontWeight: 800,
+                        fontSize: 13,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
                       {c.channel || "web"} · {c.sessionId || c.id}
                     </div>
 
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-                      <Badge>{toneDot(c.status)}&nbsp;{c.status || "open"}</Badge>
+                      <Badge>
+                        {toneDot(c.status)}&nbsp;{c.status || "open"}
+                      </Badge>
                       <Badge>takeover: {c.takeoverMode || "bot"}</Badge>
                     </div>
 
@@ -393,12 +456,23 @@ export default function App() {
             }}
           >
             <div style={{ minWidth: 0 }}>
-              <div style={{ color: "white", fontWeight: 900, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              <div
+                style={{
+                  color: "white",
+                  fontWeight: 900,
+                  fontSize: 15,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
                 {active ? `Conversație: ${active.sessionId || active.id}` : "Selectează o conversație"}
               </div>
               {active ? (
                 <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 8 }}>
-                  <Badge>{toneDot(active.status)}&nbsp;{active.status}</Badge>
+                  <Badge>
+                    {toneDot(active.status)}&nbsp;{active.status}
+                  </Badge>
                   <Badge>takeover: {active.takeoverMode}</Badge>
                   <Badge>{active.channel}</Badge>
                 </div>

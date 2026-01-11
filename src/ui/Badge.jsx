@@ -39,4 +39,10 @@ export function toneFromStatus(status) {
   if (status === "pending") return "warn";
   if (status === "closed") return "danger";
   return "ok";
+
+}
+export function toneFromConversation(c) {
+  if (c.priority === 1 || c.status === "pending") return "danger";
+  if (c.status === "closed") return "neutral";
+  return "ok";
 }
